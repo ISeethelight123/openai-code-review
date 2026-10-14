@@ -1,0 +1,39 @@
+//线性规划二次约束 qclp vs socp
+baseDir = "D:/data/qclp/"
+
+/*qclp*/
+
+r = flatten(matrix(select * from loadText(baseDir + "r.csv")))
+
+V = matrix(select * from loadText(baseDir + "V.csv"))
+k = 10000
+
+A = (eye(size(r))).transpose()
+b = flatten(matrix(select * from loadText(baseDir + "b.csv")))
+
+Aeq = matrix(take(1, size(r))).transpose()
+beq  =  [7.3836]
+
+timer res1 = qclp(-r, V, k, A, b, Aeq, beq)
+print(res1)
+
+////socp
+
+F = cholesky(V,false)
+
+
+// G [A, -F] 
+G = A // A*x <= b
+G = concatMatrix([G, concatMatrix([matrix(DOUBLE, 1, A.cols(), , 0), -F],false)], false)  // -F
+
+// h [b, k^(0.5)]
+h = b // A*x <= b
+h.append!([pow(k,0.5)]).append!(take(0, size(r))) // k^(0.5)
+
+// l,q
+l=200 //线性约束维度
+q = [201] //二阶锥约束维度
+
+timer res2 = socp(r, G, h, l, q, Aeq, beq);
+
+print(res2)

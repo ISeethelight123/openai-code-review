@@ -1,0 +1,125 @@
+def cal_residual(y, x){
+    o = ols(y.col(0), x, intercept=false, mode=2, method='svd', usePinv=true)
+    return table(y.rowNames() as code, o.Residual as value)
+}
+
+def industry_neutralization(code, value, industry, style_factors=NULL){
+    // style_factors: n×k 矩阵，可选；空填 0 后与行业 dummy 一起进 X
+    n = code.size()
+    k = 0
+    // isNull(矩阵) 返回布尔矩阵，不能用于 if；用 form 判断是否传入矩阵
+    if (form(style_factors) == MATRIX) {
+        k = cols(style_factors)
+        if (k > 0 && rows(style_factors) != n) {
+            throw "style_factors 行数必须与 code 长度一致"
+        }
+    }
+
+    t = table(code as code, value as value, industry as industry)
+    styleNames = array(STRING, 0, 0)
+    if (k > 0) {
+        sf = nullFill(double(style_factors), 0.0)
+        for (i in 0..(k - 1)) {
+            cname = "f" + string(i)
+            styleNames.append!(cname)
+            t[cname] = sf.col(i)  // sf[, i] 仍是矩阵，赋值需要向量
+        }
+    }
+
+    t = select *, 1.0 as v, "y" as y_col from t
+    t = t[t.industry != null]
+    if (t.size() == 0) {
+        return take(double(), n)
+    }
+    t = select * from t order by code
+
+    // 转哑变量（exec+pivot 得到矩阵，code 在 rowNames；select+pivot 是带 code 列的表）
+    dummy_martix = exec sum(v) from t pivot by code, industry
+    y = exec value from t pivot by code, y_col
+    x_matrix = dummy_martix
+    if (k > 0) {
+        x_matrix = concatMatrix([dummy_martix, matrix(t[styleNames])])
+    }
+    return lj(table(code), cal_residual(y, x_matrix), `code).value
+}
+
+def market_neutralization(code, value, market_value, style_factors=NULL){
+    // style_factors: n×k 矩阵，可选；空填 0 后与市值一起进 X
+    n = code.size()
+    k = 0
+    // isNull(矩阵) 返回布尔矩阵，不能用于 if；用 form 判断是否传入矩阵
+    if (form(style_factors) == MATRIX) {
+        k = cols(style_factors)
+        if (k > 0 && rows(style_factors) != n) {
+            throw "style_factors 行数必须与 code 长度一致"
+        }
+    }
+
+    t = table(code as code, value as value, market_value as market_value)
+    styleNames = array(STRING, 0, 0)
+    if (k > 0) {
+        sf = nullFill(double(style_factors), 0.0)
+        for (i in 0..(k - 1)) {
+            cname = "f" + string(i)
+            styleNames.append!(cname)
+            t[cname] = sf.col(i)  // sf[, i] 仍是矩阵，赋值需要向量
+        }
+    }
+
+    t = select *, "y" as y_col, "m" as m_col from t
+    t = t[t.market_value != null]
+    if (t.size() == 0) {
+        return take(double(), n)
+    }
+    t = select * from t order by code
+
+    // 市值矩阵（exec+pivot 得到矩阵，避免表 join 时 code 列重复）
+    market_matrix = exec market_value from t pivot by code, m_col
+    y = exec value from t pivot by code, y_col
+    x_matrix = market_matrix
+    if (k > 0) {
+        x_matrix = concatMatrix([market_matrix, matrix(t[styleNames])])
+    }
+    return lj(table(code), cal_residual(y, x_matrix), `code).value
+}
+
+def industry_market_neutralization(code, value, industry, market_value, style_factors=NULL){
+    // style_factors: n×k 矩阵，可选；空填 0 后与行业、市值一起进 X
+    n = code.size()
+    k = 0
+    // isNull(矩阵) 返回布尔矩阵，不能用于 if；用 form 判断是否传入矩阵
+    if (form(style_factors) == MATRIX) {
+        k = cols(style_factors)
+        if (k > 0 && rows(style_factors) != n) {
+            throw "style_factors 行数必须与 code 长度一致"
+        }
+    }
+
+    t = table(code as code, value as value, industry as industry, market_value as market_value)
+    styleNames = array(STRING, 0, 0)
+    if (k > 0) {
+        sf = nullFill(double(style_factors), 0.0)
+        for (i in 0..(k - 1)) {
+            cname = "f" + string(i)
+            styleNames.append!(cname)
+            t[cname] = sf.col(i)  // sf[, i] 仍是矩阵，赋值需要向量
+        }
+    }
+
+    t = select *, 1.0 as v, "y" as y_col, "m" as m_col from t
+    t = t[(t.industry != null) & (t.market_value != null)]
+    if (t.size() == 0) {
+        return take(double(), n)
+    }
+    t = select * from t order by code
+
+    // exec+pivot → 矩阵（rowNames=code）；select+pivot → 表（含 code 列），join 会报 Duplicated column name code
+    industry_matrix = exec sum(v) from t pivot by code, industry
+    market_matrix = exec market_value from t pivot by code, m_col
+    y = exec value from t pivot by code, y_col
+    x_matrix = join(industry_matrix, market_matrix)
+    if (k > 0) {
+        x_matrix = concatMatrix([x_matrix, matrix(t[styleNames])])
+    }
+    return lj(table(code), cal_residual(y, x_matrix), `code).value
+}

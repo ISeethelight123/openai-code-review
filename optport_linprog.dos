@@ -1,0 +1,314 @@
+/**
+ * 多日组合优化（DolphinDB linprog）
+ *
+ * 对照 Python：
+ *   style_expose.py  +  optport_linprog.OptPortClassLinprog.getoptport_
+ *
+ * 问题形式（每日独立）：
+ *   maximize  alpha' * w
+ *   s.t.      sum(w) = 1                          // 对应 Python sumticker L=U=1
+ *             L_dot <= F' * w <= U_dot             // 风格 + 行业（无 sumticker）
+ *             L_mul <= w <= U_mul                  // mulmat = 全 1
+ *
+ * 多日：按 date 循环（对齐 getoptport），失败则 alpha 前 1/mujieat 等权兜底，最后按日归一。
+ *
+ * 通用分支（不做 A 股特殊收紧）：
+ *   风格：bm ± styleWt
+ *   行业：bm ± industryWt，再裁剪到 [0, 1]
+ *   个股：max(0, wt - stockWt) .. wt + stockWt
+ */
+
+// ============================================================
+// 1. 行业 one-hot：N x nInd
+// ============================================================
+def buildIndustryOneHot(industryVec, industryList) {
+    k = industryList.size()
+    colTuple = array(ANY, 0)
+    for (i in 0..(k - 1)) {
+        ind = industryList[i]
+        colTuple.append!(iif(industryVec == ind, 1.0, 0.0))
+    }
+    return matrix(colTuple)
+}
+
+// ============================================================
+// 2. 单日约束组装（对齐 style_expose 通用分支）
+// ============================================================
+def prepareSingleDayConstraints(
+    metrics,
+    barraNames,
+    industryList,
+    styleWt,
+    industryWt,
+    stockWt
+) {
+    /**
+     * metrics 单日表列：wind_code, resid, wt, industry_name, + barraNames
+     * F 列顺序：barraNames + industryList
+     *   （Python 的 sumticker 改由 linprog 等式 Aeq 实现，避免重复）
+     */
+    t = select * from metrics
+        where not isNull(resid) and not isNull(industry_name) and not isNull(wind_code)
+        order by wind_code
+    n = t.size()
+    if (n <= 0) {
+        throw "单日股票池为空（resid/industry 清洗后无有效股票）"
+    }
+
+    styleMat = nullFill(matrix(t[barraNames]), 0.0)
+    alpha = nullFill(double(exec resid from t), 0.0)
+    bnWt = nullFill(double(exec wt from t), 0.0)
+    codes = exec wind_code from t
+
+    indMat = buildIndustryOneHot(exec industry_name from t, industryList)
+    F = nullFill(concatMatrix([styleMat, indMat]), 0.0)
+
+    // bm_exp = sum(factor * wt)  —— 与 Python calc_bm_style 一致（按当前股票池）
+    bnMat = F.transpose() ** bnWt
+    bnExp = nullFill(double(bnMat[0]), 0.0)
+
+    nStyle = barraNames.size()
+    nInd = industryList.size()
+    styleBn = head(bnExp, nStyle)
+    indBn = tail(bnExp, nInd)
+
+    // 风格：bm ± styleWt
+    styleLower = styleBn - styleWt
+    styleUpper = styleBn + styleWt
+
+    // 行业：bm ± industryWt，再裁剪到 [0, 1]（对齐 Python lower_bond/upper_bond）
+    indLower = max(indBn - industryWt, 0.0)
+    indUpper = min(indBn + industryWt, 1.0)
+
+    lowerDot = array(DOUBLE, 0)
+    lowerDot.append!(styleLower)
+    lowerDot.append!(indLower)
+
+    upperDot = array(DOUBLE, 0)
+    upperDot.append!(styleUpper)
+    upperDot.append!(indUpper)
+
+    // 个股：mulmat=1 → max(0, wt-stockWt) <= w <= wt+stockWt
+    lowerMul = max(bnWt - stockWt, 0.0)
+    upperMul = bnWt + stockWt
+
+    return dict(
+        `codes`alpha`F`lowerDot`upperDot`lowerMul`upperMul,
+        (codes, alpha, F, lowerDot, upperDot, lowerMul, upperMul)
+    )
+}
+
+// ============================================================
+// 3. 单日 linprog（对齐 getdotoptport / _getdtoptport_）
+// ============================================================
+def solveOptPortLinprog(alpha, F, lowerDot, upperDot, lowerMul, upperMul) {
+    /**
+     * minimize (-alpha)' w
+     * s.t.  F'w 在 [lowerDot, upperDot]
+     *       lowerMul <= w <= upperMul
+     *       sum(w) = 1
+     */
+    n = alpha.size()
+    if (n <= 0) {
+        return dict(`ok`wtTable`status, (false, NULL, "empty_universe"))
+    }
+
+    f = nullFill(-double(alpha), 0.0)
+
+    Ft = nullFill(F.transpose(), 0.0)
+    A = concatMatrix([Ft, -Ft], false)
+    b = array(DOUBLE, 0)
+    b.append!(nullFill(double(upperDot), 0.0))
+    b.append!(nullFill(-double(lowerDot), 0.0))
+
+    Aeq = matrix(DOUBLE, 1, n, , 1.0)
+    beq = [1.0]
+
+    lb = nullFill(double(lowerMul), 0.0)
+    ub = nullFill(double(upperMul), 0.0)
+
+    statusTag = "optimal"
+    res = NULL
+    firstErr = ""
+    try {
+        res = linprog(f, A, b, Aeq, beq, lb, ub)
+    } catch (ex) {
+        firstErr = string(ex)
+        return dict(`ok`wtTable`status, (false, NULL, "linprog_exception:" + firstErr))
+    }
+
+    // res 成功为 (obj, x) 元组；勿用 res==NULL（会对元素逐元比较，or 标量会 shapes incompatible）
+    if (typestr(res) == "VOID" or size(res) < 2) {
+        return dict(`ok`wtTable`status, (false, NULL, "linprog_failed:" + firstErr))
+    }
+    wtRaw = res[1]
+    if (typestr(wtRaw) == "VOID" or count(wtRaw) == 0) {
+        return dict(`ok`wtTable`status, (false, NULL, "linprog_empty_x"))
+    }
+    wt = flatten(double(wtRaw))
+    if (wt.size() != n) {
+        return dict(`ok`wtTable`status, (false, NULL, "linprog_dim_mismatch"))
+    }
+    if (any(isNull(wt)) or any(isNanInf(wt)) or sum(wt) <= 1e-8 or max(wt) > 1e20) {
+        return dict(`ok`wtTable`status, (false, NULL, "invalid_solution"))
+    }
+
+    // 事后：wt<=0 置空（对齐 Python）
+    wt = iif(wt <= 0, double(NULL), wt)
+    out = table((0..(n - 1)) as idx, wt as wt)
+    out = select * from out where not isNull(wt) and wt > 1e-5
+    if (out.size() == 0) {
+        return dict(`ok`wtTable`status, (false, NULL, "all_nonpositive"))
+    }
+    s = sum(out.wt)
+    if (isNull(s) or s <= 0) {
+        return dict(`ok`wtTable`status, (false, NULL, "zero_sum"))
+    }
+    update out set wt = wt / s
+    return dict(`ok`wtTable`status, (true, out, statusTag))
+}
+
+// ============================================================
+// 4. 失败兜底：alpha 前 1/mujieat 等权（对齐 getoptport）
+// ============================================================
+def fallbackEqualWeight(codes, alpha, mujieat) {
+    n = codes.size()
+    k = floor(1.0 / mujieat + 1e-12)
+    k = int(k)
+    if (k < 1) k = 1
+    if (k > n) k = n
+    // 降序下标：alpha 大的在前
+    ord = isort(alpha, false)
+    pick = head(ord, k)
+    pickCodes = codes[pick]
+    w = take(1.0 / double(k), k)
+    return table(pickCodes as wind_code, w as wt)
+}
+
+// ============================================================
+// 5. 单日入口
+// ============================================================
+def optimizeSingleDay(
+    metrics,
+    barraNames,
+    industryList,
+    styleWt=0.15,
+    industryWt=0.10,
+    stockWt=0.05,
+    minWt=0.0,
+    mujieat=0.05
+) {
+    prep = prepareSingleDayConstraints(
+        metrics, barraNames, industryList, styleWt, industryWt, stockWt
+    )
+    solved = solveOptPortLinprog(
+        prep[`alpha], prep[`F],
+        prep[`lowerDot], prep[`upperDot],
+        prep[`lowerMul], prep[`upperMul]
+    )
+
+    if (solved[`ok]) {
+        codes = prep[`codes]
+        wtab = solved[`wtTable]
+        result = table(codes[exec idx from wtab] as wind_code, (exec wt from wtab) as wt)
+    } else {
+        // 对齐 Python：失败不抛死，等权兜底
+        print("警告: 单日 linprog 失败(" + string(solved[`status]) + ")，改用等权兜底")
+        result = fallbackEqualWeight(prep[`codes], prep[`alpha], mujieat)
+    }
+
+    if (minWt > 0) {
+        result = select * from result where wt >= minWt
+    } else {
+        result = select * from result where wt > 1e-5
+    }
+    tw = sum(result.wt)
+    if (isNull(tw) or tw <= 0) {
+        throw "单日结果权重和为 0"
+    }
+    result = select wind_code, wt / tw as wt from result
+    return result
+}
+
+// ============================================================
+// 6. 多日入口（对齐 getoptport 按日循环）
+// ============================================================
+def optimizeMultiDay(
+    metrics,
+    barraNames,
+    industryList,
+    styleWt=0.15,
+    industryWt=0.10,
+    stockWt=0.05,
+    minWt=0.0,
+    mujieat=0.05
+) {
+    /**
+     * metrics 多日表，须含 date 列以及单日所需列。
+     * 返回：date, wind_code, wt（已按日归一）
+     * 对齐 Python getoptport：for optdt in optperiods
+     */
+    if (!(`date in metrics.columnNames())) {
+        throw "metrics 缺少 date 列"
+    }
+    dates = sort(distinct(exec date from metrics))
+    if (dates.size() <= 0) {
+        throw "多日 metrics 无有效日期"
+    }
+
+    allParts = array(ANY, 0)
+    for (i in 0..(dates.size() - 1)) {
+        dt = dates[i]
+        dayMetrics = select * from metrics where date = dt
+        part = optimizeSingleDay(
+            dayMetrics, barraNames, industryList,
+            styleWt, industryWt, stockWt, minWt, mujieat
+        )
+        part = select dt as date, wind_code, wt from part
+        allParts.append!(part)
+    }
+
+    funduse = allParts[0]
+    if (allParts.size() > 1) {
+        for (j in 1..(allParts.size() - 1)) {
+            funduse = unionAll([funduse, allParts[j]], false)
+        }
+    }
+    funduse = select date, wind_code, wt / sum(wt) as wt from funduse context by date
+    return funduse
+}
+
+// ============================================================
+// 7. 演示：两日假数据
+// ============================================================
+barraNames = `bp`growth`size
+industryList = `银行`医药`计算机
+
+demo = table(
+    2023.12.20 2023.12.20 2023.12.20 2023.12.20 2023.12.20
+    2023.12.21 2023.12.21 2023.12.21 2023.12.21 2023.12.21 as date,
+    `000001.SZ`000002.SZ`000003.SZ`000004.SZ`000005.SZ
+    `000001.SZ`000002.SZ`000003.SZ`000004.SZ`000005.SZ as wind_code,
+    `银行`银行`医药`医药`计算机
+    `银行`银行`医药`医药`计算机 as industry_name,
+    0.12 0.08 -0.05 0.03 0.10
+    0.11 0.09 -0.04 0.02 0.12 as resid,
+    0.25 0.20 0.20 0.15 0.20
+    0.25 0.20 0.20 0.15 0.20 as wt,
+    0.5 -0.2 0.1 0.3 -0.4
+    0.4 -0.1 0.2 0.2 -0.3 as bp,
+    0.2 0.1 -0.3 0.0 0.4
+    0.1 0.2 -0.2 0.1 0.3 as growth,
+    -0.1 0.3 0.2 -0.2 0.1
+    0.0 0.2 0.1 -0.1 0.2 as size
+)
+
+portWt = optimizeMultiDay(
+    demo, barraNames, industryList,
+    styleWt=0.15, industryWt=0.10, stockWt=0.05,
+    minWt=0.0, mujieat=0.05
+)
+
+print("===== 多日优化权重 =====")
+print(portWt)
+print(select date, sum(wt) as sum_wt from portWt group by date)

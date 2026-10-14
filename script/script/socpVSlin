@@ -1,0 +1,47 @@
+l//linprog vs socp
+baseDir = "D:/data/linprog/"
+
+/*linprog*/
+lb = -10
+ub = 10
+
+f = flatten(matrix(select * from loadText(baseDir + "f.csv")))
+A = matrix(select * from loadText(baseDir + "A.csv"))
+b = flatten(matrix(select * from loadText(baseDir + "b.csv")))
+
+
+Aeq = matrix(take(1, size(f))).transpose()
+beq = array(DOUBLE).append!(1)
+
+print('res_linprog:')
+timer res_linprog_simp = linprog(f, A, b, Aeq, beq, lb, ub)  
+print('Optimal value:',res_linprog_simp[0])
+print(res_linprog_simp[1])
+
+
+
+/*socp*/
+N = f.size()
+E = eye(N)
+zeros = matrix(DOUBLE, N, N, ,0)
+
+//G = [-E,E,A]
+G = -E // -x <= -lb
+G = concatMatrix([G, E], false) // x <= ub
+G = concatMatrix([G, A], false) // A*x <= b
+
+//h = [-lb, ub, b]
+h = array(DOUBLE).append!(take(10, N)) // -x <= -lb
+h.append!(take(10, N)) // x <= ub
+h.append!(b) // A*x <= b
+
+// l, q
+l =600 // All constrains are linear.
+q = []
+
+print('res_socp:')
+timer res_socp = socp(f, G, h, l, q, Aeq, beq);
+print('Optimal value:', res_socp[2])
+print(res_socp[1])
+
+
